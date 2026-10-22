@@ -39,6 +39,7 @@ import * as AgentSessionScanner from "./AgentSessionScanner.ts";
 import * as ProjectService from "./ProjectService.ts";
 
 const IMPORT_EVENT_PREFIX = "agent-session-import:v2";
+const IMPORTED_MESSAGE_ID_PATTERN = /:\d{6}$/;
 const CLAUDE_SESSION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const decodeImportedTranscriptPayload = Schema.decodeUnknownOption(
@@ -86,14 +87,19 @@ function dateTime(value: string): DateTime.Utc {
   return DateTime.makeUnsafe(value);
 }
 
+function importedMessageId(threadId: ThreadId, index: number) {
+  return MessageId.make(`${threadId}:${String(index).padStart(6, "0")}`);
+}
+
 function messageEvents(input: {
   readonly threadId: ThreadId;
   readonly index: number;
   readonly message: AgentSessionScanner.AgentSessionThreadMessage;
+  readonly eventIds: { readonly message: EventId; readonly turnItem: EventId };
 }): ReadonlyArray<OrchestrationV2DomainEvent> {
   const ordinal = input.index + 1;
   const suffix = String(input.index).padStart(6, "0");
-  const messageId = MessageId.make(`${input.threadId}:${suffix}`);
+  const messageId = importedMessageId(input.threadId, input.index);
   const turnItemId = TurnItemId.make(
     `${IMPORT_EVENT_PREFIX}:turn-item:${input.threadId}:${suffix}`,
   );
@@ -149,14 +155,14 @@ function messageEvents(input: {
         };
   return [
     {
-      id: EventId.make(`${IMPORT_EVENT_PREFIX}:message:${input.threadId}:${suffix}`),
+      id: input.eventIds.message,
       type: "message.updated",
       threadId: input.threadId,
       occurredAt: at,
       payload: message,
     },
     {
-      id: EventId.make(`${IMPORT_EVENT_PREFIX}:turn-item:${input.threadId}:${suffix}`),
+      id: input.eventIds.turnItem,
       type: "turn-item.updated",
       threadId: input.threadId,
       occurredAt: at,
@@ -228,7 +234,11 @@ const make = Effect.gen(function* () {
         );
         if (outcome._tag === "AlreadyImported") {
           importedThreadIds.add(threadId);
-          importedCount += 1;
+          const deleted = yield* orchestrator.getThreadRecords(threadId, []).pipe(
+            Effect.map((records) => records.thread.deletedAt !== null),
+            Effect.orElseSucceed(() => false),
+          );
+          if (!deleted) importedCount += 1;
           return;
         }
         if (outcome._tag === "Duplicate") {
@@ -267,21 +277,83 @@ const make = Effect.gen(function* () {
             },
             { onConflict: "ignore" },
           );
-          const existing = yield* Effect.option(orchestrator.getThreadRecords(threadId, []));
+          const existing = yield* Effect.option(
+            orchestrator.getThreadRecords(threadId, ["runs", "messages"]),
+          );
           if (Option.isSome(existing)) {
-            if (existing.value.thread.projectId !== input.projectId) {
+            const records = existing.value;
+            if (records.thread.projectId !== input.projectId) {
               return yield* new AgentSessionThreadProjectConflictError({
                 threadId,
                 expectedProjectId: input.projectId,
-                actualProjectId: existing.value.thread.projectId,
+                actualProjectId: records.thread.projectId,
               });
             }
-            if (existing.value.thread.historyOrigin !== "v1_import") {
+            if (records.thread.historyOrigin !== "v1_import") {
               return yield* new AgentSessionThreadModifiedError({ threadId });
+            }
+            // historyOrigin never changes after import; a run means T3 now owns the thread.
+            // Record the transcript so later refreshes skip parsing it.
+            if (records.thread.deletedAt !== null || records.runs.length > 0) {
+              yield* persistRuntime;
+              yield* runtimes.recordImportedTranscript({ threadId, source });
+              return records.thread.deletedAt !== null ? "deleted" : "imported";
+            }
+            const storedMessages = new Map(
+              records.messages.map((message) => [message.id, message]),
+            );
+            const storedImportedCount = records.messages.filter(
+              (message) => message.runId === null && IMPORTED_MESSAGE_ID_PATTERN.test(message.id),
+            ).length;
+            if (thread.messages.length < storedImportedCount) {
+              yield* Effect.logWarning("Skipped refreshing a shrunken agent session", {
+                provider: thread.source,
+                sessionId: thread.providerSessionId,
+                storedCount: storedImportedCount,
+                transcriptCount: thread.messages.length,
+              });
+              return "skipped";
+            }
+            // There is no message delete event, so slots are rewritten in place by id.
+            const changed = thread.messages.flatMap((message, index) => {
+              const stored = storedMessages.get(importedMessageId(threadId, index));
+              const unchanged =
+                stored !== undefined &&
+                stored.role === message.role &&
+                stored.text === message.text &&
+                DateTime.toEpochMillis(stored.createdAt) ===
+                  DateTime.toEpochMillis(dateTime(message.createdAt));
+              return unchanged ? [] : [{ message, index }];
+            });
+            const events = yield* Effect.forEach(changed, ({ message, index }) =>
+              Effect.gen(function* () {
+                const eventIds = {
+                  message: yield* idAllocator.allocate.event({ threadId }),
+                  turnItem: yield* idAllocator.allocate.event({ threadId }),
+                };
+                return messageEvents({ threadId, index, message, eventIds });
+              }),
+            );
+            if (events.length > 0) {
+              const committed = yield* eventSink.write({
+                unlessThreadHasRunOrIsDeleted: threadId,
+                unlessNativeThreadOwned: {
+                  driver,
+                  providerInstanceId: thread.providerInstanceId,
+                  appThreadId: threadId,
+                  nativeThreadRef: {
+                    driver,
+                    nativeId: thread.providerSessionId,
+                    strength: "strong",
+                  },
+                },
+                events: events.flat(),
+              });
+              if (committed.length === 0) return "ignored";
             }
             yield* persistRuntime;
             yield* runtimes.recordImportedTranscript({ threadId, source });
-            return true;
+            return "imported";
           }
 
           const model = thread.model ?? DEFAULT_MODEL_BY_PROVIDER[driver] ?? DEFAULT_MODEL;
@@ -363,7 +435,19 @@ const make = Effect.gen(function* () {
                 payload: appThread,
               },
               ...thread.messages.flatMap((message, index) =>
-                messageEvents({ threadId, index, message }),
+                messageEvents({
+                  threadId,
+                  index,
+                  message,
+                  eventIds: {
+                    message: EventId.make(
+                      `${IMPORT_EVENT_PREFIX}:message:${importedMessageId(threadId, index)}`,
+                    ),
+                    turnItem: EventId.make(
+                      `${IMPORT_EVENT_PREFIX}:turn-item:${importedMessageId(threadId, index)}`,
+                    ),
+                  },
+                }),
               ),
               {
                 id: EventId.make(`${IMPORT_EVENT_PREFIX}:provider-thread:${providerThreadId}`),
@@ -376,23 +460,25 @@ const make = Effect.gen(function* () {
               },
             ],
           });
-          if (committed.length === 0) return null;
+          if (committed.length === 0) return "ignored";
           yield* persistRuntime;
           yield* runtimes.recordImportedTranscript({ threadId, source });
-          return true;
+          return "imported";
         }).pipe(
           Effect.catch((cause) =>
             Effect.logWarning("Could not import an agent session", {
               provider: outcome.thread.source,
               sessionId: outcome.thread.providerSessionId,
               cause,
-            }).pipe(Effect.as(false)),
+            }).pipe(Effect.as("skipped" as const)),
           ),
         );
-        if (imported === true) {
+        if (imported === "imported") {
           importedThreadIds.add(threadId);
           importedCount += 1;
-        } else if (imported === false) {
+        } else if (imported === "deleted") {
+          importedThreadIds.add(threadId);
+        } else if (imported === "skipped") {
           skippedCount += 1;
         }
       }),

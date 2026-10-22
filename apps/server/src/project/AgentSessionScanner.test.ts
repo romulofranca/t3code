@@ -1214,6 +1214,59 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
       }),
     );
 
+    it.effect("finds transcripts created after a scan once the cached scan expires", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const workspace = yield* makeTempDir("t3code-workspace-");
+        const writeSession = (sessionId: string) =>
+          writeTranscript({
+            filePath: path.join(
+              codexHomePath,
+              "sessions",
+              "2026",
+              "08",
+              "24",
+              `${sessionId}.jsonl`,
+            ),
+            contents: [
+              encodeTranscriptRecord({
+                type: "session_meta",
+                payload: { id: sessionId, cwd: workspace },
+              }),
+              encodeTranscriptRecord({
+                type: "event_msg",
+                payload: { type: "user_message", message: "Keep going" },
+              }),
+            ].join("\n"),
+            mtimeMs: nowMs,
+          });
+        const sessionIds = (outcomes: Iterable<AgentSessionScanner.AgentSessionRecentThread>) =>
+          Array.from(outcomes).flatMap((outcome) =>
+            outcome._tag === "Importable" ? [outcome.thread.providerSessionId] : [],
+          );
+        yield* writeSession("rollout-before-scan");
+        const scanner = yield* AgentSessionScanner.AgentSessionScanner.pipe(
+          Effect.provide(layerScannerTest({ claudeHomePath, codexHomePath })),
+        );
+        yield* scanner.scan;
+        yield* writeSession("rollout-after-scan");
+
+        const cached = yield* scanner.recentThreads(workspace).pipe(Stream.runCollect);
+        expect(sessionIds(cached)).toEqual(["rollout-before-scan"]);
+
+        yield* TestClock.adjust("1 minute");
+        const refreshed = yield* scanner.recentThreads(workspace).pipe(Stream.runCollect);
+        expect(sessionIds(refreshed).toSorted()).toEqual([
+          "rollout-after-scan",
+          "rollout-before-scan",
+        ]);
+      }),
+    );
+
     it.effect("skips excessive records without blocking an older valid transcript", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;

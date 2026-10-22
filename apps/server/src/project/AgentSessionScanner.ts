@@ -63,6 +63,7 @@ const RECENT_THREAD_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
  */
 const MAX_IMPORTED_TRANSCRIPT_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_IMPORTED_MESSAGES = 200;
+const CANDIDATE_CACHE_TTL_MS = 60_000;
 const MAX_IMPORT_HISTORY_BYTES = 32 * 1024 * 1024;
 const MAX_IMPORT_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_IMPORT_TRANSCRIPTS = 100;
@@ -1190,11 +1191,19 @@ export const make = Effect.gen(function* () {
     return { candidates: raw, truncated };
   });
 
-  let cachedCandidates: ReadonlyArray<RawCandidate> | null = null;
+  // Onboarding imports every selected project from one scan; a later refresh
+  // must rescan to find new transcripts.
+  let cachedCandidates: {
+    readonly candidates: ReadonlyArray<RawCandidate>;
+    readonly collectedAtMs: number;
+  } | null = null;
 
   const scan: AgentSessionScanner["Service"]["scan"] = Effect.gen(function* () {
     const { candidates: raw, truncated } = yield* collectCandidates();
-    cachedCandidates = raw;
+    cachedCandidates = {
+      candidates: raw,
+      collectedAtMs: DateTime.toEpochMillis(yield* DateTime.now),
+    };
 
     const merged = new Map<
       string,
@@ -1324,8 +1333,16 @@ export const make = Effect.gen(function* () {
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
     const cutoffMs = nowMs - RECENT_THREAD_WINDOW_MS;
 
-    const candidates = cachedCandidates ?? (yield* collectCandidates()).candidates;
-    cachedCandidates = candidates;
+    if (
+      cachedCandidates === null ||
+      nowMs - cachedCandidates.collectedAtMs >= CANDIDATE_CACHE_TTL_MS
+    ) {
+      cachedCandidates = {
+        candidates: (yield* collectCandidates()).candidates,
+        collectedAtMs: nowMs,
+      };
+    }
+    const { candidates } = cachedCandidates;
 
     const eligibleTranscripts: Array<{
       readonly candidate: RawCandidate;

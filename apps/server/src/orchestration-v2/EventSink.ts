@@ -73,6 +73,8 @@ export interface EventSinkV2Shape {
       OrchestrationV2ProviderThread,
       "driver" | "providerInstanceId" | "appThreadId" | "nativeThreadRef"
     >;
+    /** Return no events if this thread is deleted or has a run at commit time. */
+    readonly unlessThreadHasRunOrIsDeleted?: ThreadId;
     readonly guardPendingUserInputCancellations?: boolean;
     readonly commandId?: CommandId;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
@@ -394,7 +396,8 @@ const layerBase: Layer.Layer<
       });
 
     const writeEffect = Effect.fn("orchestrationV2.EventSink.write")(function* (
-      input: Parameters<EventSinkV2Shape["writeWithEffects"]>[0],
+      input: Parameters<EventSinkV2Shape["writeWithEffects"]>[0] &
+        Pick<Parameters<EventSinkV2Shape["write"]>[0], "unlessThreadHasRunOrIsDeleted">,
     ) {
       yield* Effect.annotateCurrentSpan({
         "orchestration_v2.command_id": input.commandId ?? null,
@@ -417,6 +420,22 @@ const layerBase: Layer.Layer<
               LIMIT 1
             `;
             if (owners.length > 0) return { committed: [], outcomes: [] };
+          }
+          const guardedThreadId = input.unlessThreadHasRunOrIsDeleted;
+          if (guardedThreadId !== undefined) {
+            const claimed = yield* sql`
+              SELECT 1
+              FROM orchestration_v2_projection_threads
+              WHERE thread_id = ${guardedThreadId}
+                AND (
+                  deleted_at IS NOT NULL
+                  OR EXISTS (
+                    SELECT 1 FROM orchestration_v2_projection_runs WHERE thread_id = ${guardedThreadId}
+                  )
+                )
+              LIMIT 1
+            `;
+            if (claimed.length > 0) return { committed: [], outcomes: [] };
           }
           // Checkpoint capture can finish after a cohort writer reads its parent run.
           // Merge in this transaction so the event log and projection keep that completion.

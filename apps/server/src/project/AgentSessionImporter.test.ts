@@ -1,12 +1,15 @@
 import { expect, it } from "@effect/vitest";
 import {
   EventId,
+  MessageId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  RunId,
   ThreadId,
   type ApplicationStoredEvent,
   type OrchestrationV2AppThread,
+  type OrchestrationV2DomainEvent,
   type OrchestrationV2ProviderThread,
 } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -162,7 +165,7 @@ const seedOwner = Effect.fn(function* (
 });
 
 const makeImporter = Effect.fn(function* (
-  candidates: ReadonlyArray<ReturnType<typeof candidate>>,
+  candidates: ReadonlyArray<AgentSessionScanner.AgentSessionRecentThread>,
   beforeTransaction: Effect.Effect<void> = Effect.void,
 ) {
   const sql = yield* SqlClient.SqlClient;
@@ -387,4 +390,234 @@ it.effect(
         runtimePayload: { importedTranscripts: [source.source] },
       });
     }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+function transcriptMessages(count: number) {
+  return Array.from({ length: count }, (_, index) => ({
+    role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
+    text: `message ${index}`,
+    createdAt: timestamp,
+  }));
+}
+
+function continued(
+  source: ReturnType<typeof candidate>,
+  messages: ReturnType<typeof candidate>["thread"]["messages"],
+  identity: { readonly size: number; readonly mtimeMs: number },
+): ReturnType<typeof candidate> {
+  return {
+    ...source,
+    source: { ...source.source, ...identity },
+    thread: { ...source.thread, messages },
+  };
+}
+
+const importedThreadState = Effect.fn(function* (threadId: ThreadId) {
+  const projections = yield* ProjectionStore.ProjectionStoreV2;
+  const events = yield* EventStore.EventStoreV2;
+  const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+  return {
+    records: yield* projections.getThreadRecords(threadId, ["messages", "turnItems"]),
+    events: yield* events.read({ threadId }).pipe(Stream.runCollect),
+    runtime: yield* runtimes.getByThreadId({ threadId }),
+  };
+});
+
+it.effect(
+  "refreshes appended messages without rewriting unchanged slots, and writes nothing on a retry",
+  () =>
+    Effect.gen(function* () {
+      const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+      const initial = candidate(CODEX_MODEL_SELECTION, "continued");
+      const threadId = importId(initial);
+      yield* (yield* makeImporter([initial])).run;
+
+      const next = continued(
+        initial,
+        [...initial.thread.messages, { role: "user", text: "One more", createdAt: timestamp }],
+        { size: 200, mtimeMs: 5 },
+      );
+      const refresh = yield* makeImporter([next]);
+      expect(yield* refresh.run).toEqual({ importedCount: 1, skippedCount: 0 });
+      expect(
+        refresh.published.flatMap((stored) => ("event" in stored ? [stored.event.type] : [])),
+      ).toEqual(["message.updated", "turn-item.updated"]);
+      const state = yield* importedThreadState(threadId);
+      expect(state.records.messages.map((message) => [message.id, message.text])).toEqual([
+        [`${threadId}:000000`, "Fix it"],
+        [`${threadId}:000001`, "Fixed"],
+        [`${threadId}:000002`, "One more"],
+      ]);
+      expect(state.records.turnItems.map((item) => item.ordinal)).toEqual([1, 2, 3]);
+      expect(Option.getOrThrow(yield* runtimes.getByThreadId({ threadId }))).toMatchObject({
+        runtimePayload: { importedTranscripts: [next.source] },
+      });
+
+      expect(yield* refresh.run).toEqual({ importedCount: 1, skippedCount: 0 });
+      expect(refresh.published).toHaveLength(2);
+      expect(yield* importedThreadState(threadId)).toEqual(state);
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+it.effect("rewrites every slot in order when the retained window slides past 200", () =>
+  Effect.gen(function* () {
+    const transcript = transcriptMessages(205);
+    const initial = continued(
+      candidate(CODEX_MODEL_SELECTION, "sliding"),
+      transcript.slice(0, 200),
+      { size: 100, mtimeMs: 2 },
+    );
+    const threadId = importId(initial);
+    yield* (yield* makeImporter([initial])).run;
+
+    const window = [transcript[0]!, ...transcript.slice(-199)];
+    const refresh = yield* makeImporter([continued(initial, window, { size: 300, mtimeMs: 9 })]);
+    expect(yield* refresh.run).toEqual({ importedCount: 1, skippedCount: 0 });
+    // Slot 0 keeps the first user message; every later slot moved by five.
+    expect(refresh.published).toHaveLength(199 * 2);
+    const { records } = yield* importedThreadState(threadId);
+    expect(records.messages.map((message) => message.text)).toEqual(
+      window.map((message) => message.text),
+    );
+    expect(records.messages.map((message) => message.role)).toEqual(
+      window.map((message) => message.role),
+    );
+    expect(new Set(records.messages.map((message) => message.id)).size).toBe(200);
+    expect(
+      records.turnItems.map((item) => [item.ordinal, "text" in item ? item.text : null]),
+    ).toEqual(window.map((message, index) => [index + 1, message.text]));
+  }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+const appended = (source: ReturnType<typeof candidate>) =>
+  continued(
+    source,
+    [...source.thread.messages, { role: "user", text: "Continued", createdAt: timestamp }],
+    { size: 200, mtimeMs: 5 },
+  );
+
+const runCreated = (threadId: ThreadId) =>
+  ({
+    id: EventId.make(`${threadId}:run`),
+    type: "run.created",
+    threadId,
+    occurredAt: now,
+    payload: {
+      id: RunId.make(`${threadId}:run`),
+      threadId,
+      ordinal: 1,
+      providerInstanceId: CODEX_MODEL_SELECTION.instanceId,
+      modelSelection: CODEX_MODEL_SELECTION,
+      providerThreadId: null,
+      userMessageId: MessageId.make(`${threadId}:prompt`),
+      rootNodeId: null,
+      activeAttemptId: null,
+      status: "completed",
+      requestedAt: now,
+      startedAt: now,
+      completedAt: now,
+      checkpointId: null,
+      contextHandoffId: null,
+    },
+  }) satisfies OrchestrationV2DomainEvent;
+
+it.effect(
+  "records imported threads continued in T3 or deleted without rewriting or skipping them",
+  () =>
+    Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+      const withRun = candidate(CODEX_MODEL_SELECTION, "continued-in-t3");
+      const deleted = candidate(CODEX_MODEL_SELECTION, "deleted-after-import");
+      yield* (yield* makeImporter([withRun, deleted])).run;
+      const runThreadId = importId(withRun);
+      const deletedThreadId = importId(deleted);
+      const importedThread = yield* projections.getThread(deletedThreadId);
+      yield* sink.write({
+        events: [
+          runCreated(runThreadId),
+          {
+            id: EventId.make(`${deletedThreadId}:deleted`),
+            type: "thread.deleted",
+            threadId: deletedThreadId,
+            occurredAt: now,
+            payload: { ...importedThread, deletedAt: now },
+          },
+        ],
+      });
+      const threadIds = [runThreadId, deletedThreadId];
+      const history = (threadId: ThreadId) =>
+        importedThreadState(threadId).pipe(
+          Effect.map(({ records, events }) => ({ records, events })),
+        );
+      const before = yield* Effect.forEach(threadIds, history);
+
+      const refresh = yield* makeImporter([appended(withRun), appended(deleted)]);
+      expect(yield* refresh.run).toEqual({ importedCount: 1, skippedCount: 0 });
+      expect(refresh.published).toEqual([]);
+      expect(yield* Effect.forEach(threadIds, history)).toEqual(before);
+      for (const [threadId, source] of [
+        [runThreadId, appended(withRun)],
+        [deletedThreadId, appended(deleted)],
+      ] as const) {
+        expect(Option.getOrThrow(yield* runtimes.getByThreadId({ threadId }))).toMatchObject({
+          runtimePayload: { importedTranscripts: [source.source] },
+        });
+      }
+
+      const recorded = yield* makeImporter(
+        [withRun, deleted].map((source) => ({
+          _tag: "AlreadyImported" as const,
+          source: appended(source).source,
+        })),
+      );
+      expect(yield* recorded.run).toEqual({ importedCount: 1, skippedCount: 0 });
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+it.effect("leaves an imported thread untouched when T3 starts a run during a refresh", () =>
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const initial = candidate(CODEX_MODEL_SELECTION, "claimed-during-refresh");
+    const threadId = importId(initial);
+    yield* (yield* makeImporter([initial])).run;
+    const before = yield* importedThreadState(threadId);
+
+    const enteringTransaction = yield* Deferred.make<void>();
+    const continueTransaction = yield* Deferred.make<void>();
+    const refresh = yield* makeImporter(
+      [appended(initial)],
+      Deferred.succeed(enteringTransaction, undefined).pipe(
+        Effect.andThen(Deferred.await(continueTransaction)),
+      ),
+    );
+    const pending = yield* Effect.forkScoped(refresh.run);
+    yield* Deferred.await(enteringTransaction);
+    yield* sink.write({ events: [runCreated(threadId)] });
+    yield* Deferred.succeed(continueTransaction, undefined);
+
+    expect(yield* Fiber.join(pending)).toEqual({ importedCount: 0, skippedCount: 0 });
+    expect(refresh.published).toEqual([]);
+    const after = yield* importedThreadState(threadId);
+    expect(after.records.messages).toEqual(before.records.messages);
+    expect(after.records.turnItems).toEqual(before.records.turnItems);
+    expect(after.runtime).toEqual(before.runtime);
+  }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+it.effect("skips a transcript that shrank since it was imported", () =>
+  Effect.gen(function* () {
+    const initial = candidate(CODEX_MODEL_SELECTION, "shrunken");
+    const threadId = importId(initial);
+    yield* (yield* makeImporter([initial])).run;
+    const before = yield* importedThreadState(threadId);
+
+    const refresh = yield* makeImporter([
+      continued(initial, initial.thread.messages.slice(0, 1), { size: 50, mtimeMs: 5 }),
+    ]);
+    expect(yield* refresh.run).toEqual({ importedCount: 0, skippedCount: 1 });
+    expect(refresh.published).toEqual([]);
+    expect(yield* importedThreadState(threadId)).toEqual(before);
+  }).pipe(Effect.scoped, Effect.provide(persistence)),
 );
