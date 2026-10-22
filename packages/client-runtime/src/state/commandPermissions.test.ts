@@ -115,6 +115,23 @@ describe("command permissions", () => {
     ),
   );
 
+  it.effect("requires the destination operate grant to import agent session history", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* setup;
+        const importHistory = createCommandPermissions(runtime, WS_METHODS.agentSessionsImport);
+        registry.set(sessions(env), AsyncResult.success(grant(true)));
+        expect(registry.get(importHistory.permissionAtom(env))).toBe(true);
+        yield* importHistory.authorize(registry, env);
+        registry.set(sessions(other), AsyncResult.success(grant(false)));
+        expect(registry.get(importHistory.permissionAtom(other))).toBe(false);
+        expect((yield* importHistory.authorize(registry, other).pipe(Effect.flip))._tag).toBe(
+          "EnvironmentAuthorizationError",
+        );
+      }),
+    ),
+  );
+
   it.effect("uses the target grant for both availability and execution", () =>
     Effect.scoped(
       Effect.gen(function* () {

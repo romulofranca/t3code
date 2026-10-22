@@ -222,6 +222,12 @@ When no image is found, web and desktop show a two-character monogram with a col
 from the icon palette, derived from the saved project name. For example, `Nebula` becomes `NA`,
 `Silver Orchard` becomes `SO`, and `M7 Forge` becomes `M7`.
 
+## Refresh imported history
+
+To pick up Claude Code or Codex conversations you kept working on in the CLI after import, select
+the project, open Project, and select **Refresh** under **Imported history**. This also imports
+new conversations from the last 30 days. Conversations you continued in T3 Code are not refreshed.
+
 ## Keep the default branch current
 
 In Source Control, enable **Automatically pull** to keep the default-branch checkout up to date

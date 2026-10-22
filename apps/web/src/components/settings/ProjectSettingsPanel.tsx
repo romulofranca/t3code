@@ -11,6 +11,7 @@ import {
 } from "@t3tools/client-runtime/state/runtime";
 import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { planProjectRemoval } from "@t3tools/client-runtime/state/projects";
+import { useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/reactivity";
 import { type EnvironmentId, type ProjectIconOverride } from "@t3tools/contracts";
 import { useLocation, useNavigate } from "@tanstack/react-router";
@@ -25,6 +26,9 @@ import {
   type SidebarProjectGroupMember,
   type SidebarProjectSnapshot,
 } from "../../sidebarProjectGrouping";
+import { agentSessionImport } from "../../state/agentSessions";
+import { environmentAtomList, environmentIdsKey } from "../../state/environmentAtomList";
+import { useAtomCommand } from "../../state/use-atom-command";
 import { useEnvironments, usePrimaryEnvironmentId } from "../../state/environments";
 import { useThreadShells, waitForProjectRemoval } from "../../state/entities";
 import { projectEnvironment } from "../../state/projects";
@@ -32,6 +36,7 @@ import { ProjectFavicon } from "../ProjectFavicon";
 import { Alert, AlertDescription } from "../ui/alert";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
+import { RefreshIcon } from "../ui/refresh-icon";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import {
@@ -54,6 +59,11 @@ const ProjectIconPickerDialog = lazy(() =>
   import("./ProjectIconPickerDialog").then((module) => ({
     default: module.ProjectIconPickerDialog,
   })),
+);
+
+const importHistoryPermissionsAtom = environmentAtomList(
+  "web-agent-session-import-permissions",
+  agentSessionImport.permissionAtom,
 );
 
 export type ProjectSettingsCategory = "general" | "source-control" | "project";
@@ -185,6 +195,13 @@ function ProjectDetail({
   const deleteProject = useOrchestrationCommand(projectEnvironment.delete, {
     reportFailure: false,
   });
+  const importHistory = useAtomCommand(agentSessionImport, { reportFailure: false });
+  const importHistoryPermissions = useAtomValue(
+    importHistoryPermissionsAtom(
+      environmentIdsKey([...new Set(group.memberProjects.map((member) => member.environmentId))]),
+    ),
+  );
+  const canRefreshHistory = importHistoryPermissions.every(Boolean);
   const projectNameEditedRef = useRef(false);
 
   const faviconPath = representative.faviconPath ?? null;
@@ -307,6 +324,67 @@ function ProjectDetail({
     await updateAllMembers(input, "Failed to update project icon");
     savingFaviconRef.current = false;
     setIsSavingFavicon(false);
+  };
+
+  const [isRefreshingHistory, setIsRefreshingHistory] = useState(false);
+  const refreshImportedHistory = async () => {
+    const members = group.memberProjects;
+    setIsRefreshingHistory(true);
+    let importedCount = 0;
+    let skippedCount = 0;
+    let failedCheckouts = 0;
+    for (const member of members) {
+      const failureTitle =
+        members.length > 1
+          ? `Failed to refresh imported history on ${member.environmentLabel ?? "the current environment"}`
+          : "Failed to refresh imported history";
+      if (checkProjectAccess([member], failureTitle)) {
+        failedCheckouts += 1;
+        continue;
+      }
+      const environment = environmentById.get(member.environmentId);
+      if (environment?.connection.phase !== "connected" || !environment.serverConfig) {
+        const error = new Error(
+          `Connect ${member.environmentLabel ?? "the selected environment"} and try again.`,
+        );
+        reportFailure(failureTitle, AsyncResult.failure(Cause.fail(error)));
+        failedCheckouts += 1;
+        continue;
+      }
+      const result = await importHistory({
+        environmentId: member.environmentId,
+        input: { projectId: member.id, expectedWorkspaceRoot: member.workspaceRoot },
+      });
+      if (result._tag === "Failure") {
+        reportFailure(
+          failureTitle,
+          mapAtomCommandResult(result, () => undefined),
+        );
+        failedCheckouts += 1;
+        continue;
+      }
+      importedCount += result.value.importedCount;
+      skippedCount += result.value.skippedCount;
+    }
+    setIsRefreshingHistory(false);
+    if (failedCheckouts === members.length) return;
+    const details = [
+      `${importedCount} imported ${importedCount === 1 ? "thread" : "threads"} checked`,
+      ...(skippedCount > 0 ? [`${skippedCount} could not be refreshed`] : []),
+      ...(failedCheckouts > 0
+        ? [`${failedCheckouts} ${failedCheckouts === 1 ? "checkout" : "checkouts"} failed`]
+        : []),
+    ];
+    toastManager.add(
+      stackedThreadToast({
+        type: skippedCount > 0 || failedCheckouts > 0 ? "warning" : "success",
+        title:
+          importedCount === 0 && skippedCount === 0
+            ? "Nothing to refresh"
+            : "Imported history refreshed",
+        description: `${details.join(", ")}.`,
+      }),
+    );
   };
 
   const hasMultipleCheckouts = group.memberProjects.length > 1;
@@ -550,6 +628,23 @@ function ProjectDetail({
         <ProjectDefaultsSettings category="project" />
         <ProjectActionsSettings />
         {hasMultipleCheckouts ? checkoutChoices : null}
+        <SettingsSection title="Imported history">
+          <SettingsRow
+            title="Claude Code and Codex sessions"
+            description="Brings in sessions from the last 30 days and updates imported threads that continued in the CLI. Threads you continued in T3 Code are not refreshed."
+            control={
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={!canRefreshHistory || isRefreshingHistory}
+                onClick={() => void refreshImportedHistory()}
+              >
+                <RefreshIcon refreshing={isRefreshingHistory} />
+                {isRefreshingHistory ? "Refreshing…" : "Refresh"}
+              </Button>
+            }
+          />
+        </SettingsSection>
         <SettingsSection title="Danger">
           <SettingsRow
             title={
